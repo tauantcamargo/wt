@@ -9,8 +9,17 @@
 #   wt ls                    list worktrees for the current repo
 #   wt cd [branch]           cd into a worktree (fzf picker if no branch)
 #   wt rm [branch] [-f]      remove a worktree (fzf picker if no branch)
+#   wt rmf [branch]          force-remove a worktree (fzf picker if no branch)
+#   wt rml [-f]              remove multiple worktrees (fzf multi-picker,
+#                            asks force-all unless -f is passed)
 #   wt prune                 drop stale worktree metadata + empty sibling dir
 #   wt root                  cd to the main repo checkout
+#
+# `wt new <branch>` resolution order: an existing local branch is attached
+# as-is; otherwise, with [base] given, a new branch is created from it
+# (local or remote, e.g. `wt new my-work origin/main`); otherwise, if
+# origin/<branch> exists, a new local branch is created tracking it;
+# otherwise a new branch is created off HEAD.
 #
 # Works from inside any worktree, not just the main checkout — it always
 # resolves paths off the repo's shared .git dir.
@@ -36,6 +45,25 @@ _wt_worktrees_dir() {
 
 _wt_slug() { echo "${1//\//-}" }
 
+# Find a remote-tracking ref matching <branch> (e.g. origin/foo for foo),
+# preferring origin when more than one remote has it. Echoes the ref
+# (remote/branch) and returns 0, or returns 1 if no remote has it.
+_wt_remote_branch_ref() {
+  local root=$1 branch=$2 ref suffix
+  local -a refs matches
+  refs=(${(f)"$(git -C "$root" for-each-ref --format='%(refname:short)' refs/remotes)"})
+  for ref in "${refs[@]}"; do
+    suffix=${ref#*/}
+    [[ $suffix == $branch ]] && matches+=("$ref")
+  done
+  (( ${#matches[@]} == 0 )) && return 1
+  if (( ${#matches[@]} > 1 )) && (( ${matches[(Ie)origin/$branch]} )); then
+    echo "origin/$branch"
+  else
+    echo "${matches[1]}"
+  fi
+}
+
 _wt_help() {
   cat <<'EOF'
 usage: wt <command> [args]
@@ -44,6 +72,9 @@ usage: wt <command> [args]
   wt ls                    list worktrees for the current repo
   wt cd [branch]           cd into a worktree (fzf picker if no branch)
   wt rm [branch] [-f]      remove a worktree (fzf picker if no branch)
+  wt rmf [branch]          force-remove a worktree (fzf picker if no branch)
+  wt rml [-f]              remove multiple worktrees (fzf multi-picker,
+                           asks force-all unless -f is passed)
   wt prune                 drop stale worktree metadata + empty sibling dir
   wt root                  cd to the main repo checkout
 EOF
@@ -73,7 +104,14 @@ _wt_new() {
   elif [[ -n $base ]]; then
     git -C "$root" worktree add -b "$branch" "$wtpath" "$base" || return 1
   else
-    git -C "$root" worktree add -b "$branch" "$wtpath" || return 1
+    local remote_ref
+    remote_ref=$(_wt_remote_branch_ref "$root" "$branch")
+    if [[ -n $remote_ref ]]; then
+      echo "wt: tracking $remote_ref"
+      git -C "$root" worktree add -b "$branch" "$wtpath" "$remote_ref" || return 1
+    else
+      git -C "$root" worktree add -b "$branch" "$wtpath" || return 1
+    fi
   fi
 
   cd "$wtpath" || return 1
@@ -189,6 +227,79 @@ _wt_rm() {
   echo "wt: removed $wtpath"
 }
 
+_wt_rml() {
+  local root wdir force=0 arg reply failed=0
+  local -a selections removed_branches rm_args
+  root=$(_wt_repo_root) || { echo "wt: not inside a git repository" >&2; return 1 }
+  wdir=$(_wt_worktrees_dir)
+
+  for arg in "$@"; do
+    case $arg in
+      -f|--force) force=1 ;;
+    esac
+  done
+
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "wt: rml requires fzf" >&2
+    return 1
+  fi
+
+  selections=(${(f)"$(git -C "$root" worktree list --porcelain \
+    | awk -v root="$root" '/^worktree /{p=$2} /^$/{if (p!="" && p!=root) print p; p=""}' \
+    | fzf -m --prompt="remove worktrees> " \
+        --header='tab/space: toggle select · enter: confirm' \
+        --bind 'space:toggle+down')"})
+  (( ${#selections[@]} == 0 )) && return 1
+
+  if (( ! force )); then
+    printf "wt: force-remove all %d selected worktree(s) (discards uncommitted changes)? [y/N] " ${#selections[@]}
+    read -r reply
+    [[ $reply == [yY]* ]] && force=1
+  fi
+
+  local wtpath wtpath_real root_real branch
+  root_real=$(cd "$root" && pwd -P)
+
+  for wtpath in "${selections[@]}"; do
+    [[ -z $wtpath || ! -e $wtpath ]] && continue
+    wtpath_real=$(cd "$wtpath" && pwd -P)
+    if [[ $wtpath_real == "$root_real" ]]; then
+      echo "wt: refusing to remove the main worktree" >&2
+      continue
+    fi
+
+    branch=$(git -C "$wtpath" symbolic-ref --quiet --short HEAD 2>/dev/null)
+
+    case "$(pwd -P)" in
+      "$wtpath_real"|"$wtpath_real"/*) cd "$root" ;;
+    esac
+
+    rm_args=(worktree remove "$wtpath")
+    (( force )) && rm_args+=(--force)
+    if git -C "$root" "${rm_args[@]}"; then
+      echo "wt: removed $wtpath"
+      [[ -n $branch ]] && removed_branches+=("$branch")
+    else
+      echo "wt: failed to remove $wtpath (uncommitted changes — rerun 'wt rml -f')" >&2
+      failed=1
+    fi
+  done
+
+  if (( ${#removed_branches[@]} )); then
+    printf "wt: delete local branch(es) %s too? [y/N] " "${(j:, :)removed_branches}"
+    read -r reply
+    if [[ $reply == [yY]* ]]; then
+      for branch in "${removed_branches[@]}"; do
+        git -C "$root" show-ref --verify --quiet "refs/heads/$branch" || continue
+        git -C "$root" branch -d "$branch" 2>/dev/null || git -C "$root" branch -D "$branch"
+      done
+    fi
+  fi
+
+  rmdir "$wdir" 2>/dev/null
+  return $failed
+}
+
 _wt_prune() {
   local root wdir
   root=$(_wt_repo_root) || { echo "wt: not inside a git repository" >&2; return 1 }
@@ -211,6 +322,8 @@ wt() {
     ls|list) shift; _wt_ls "$@" ;;
     cd) shift; _wt_cd "$@" ;;
     rm|remove) shift; _wt_rm "$@" ;;
+    rmf) shift; _wt_rm "$@" -f ;;
+    rml) shift; _wt_rml "$@" ;;
     prune) shift; _wt_prune "$@" ;;
     root|main) _wt_root ;;
     ""|-h|--help|help) _wt_help ;;
@@ -220,10 +333,10 @@ wt() {
 
 _wt_complete() {
   local -a subs
-  subs=(new ls cd rm prune root help)
+  subs=(new ls cd rm rmf rml prune root help)
   if (( CURRENT == 2 )); then
     _describe 'command' subs
-  elif (( CURRENT == 3 )) && [[ ${words[2]} == (cd|rm) ]]; then
+  elif (( CURRENT == 3 )) && [[ ${words[2]} == (cd|rm|rmf) ]]; then
     local root wdir
     root=$(_wt_repo_root 2>/dev/null) || return
     local -a names
