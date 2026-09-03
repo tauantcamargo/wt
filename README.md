@@ -34,18 +34,27 @@ wt new <branch> [base]   create (or attach to) a worktree and cd into it
 wt ls                    list worktrees for the current repo
 wt cd [branch]           cd into a worktree (fzf picker if no branch)
 wt rm [branch] [-f]      remove a worktree (fzf picker if no branch)
+wt rmf [branch]          force-remove a worktree (fzf picker if no branch)
+wt rml [-f]              remove multiple worktrees (fzf multi-picker,
+                         asks force-all unless -f is passed)
 wt prune                 drop stale worktree metadata + empty sibling dir
 wt root                  cd to the main repo checkout
 ```
 
-`wt new` reuses the branch if it already exists locally, otherwise creates
-it — from `base` if given, otherwise from the current `HEAD`. Every command
-works from inside any worktree, not just the main checkout: paths are
-always resolved off the repo's shared `.git` dir.
+`wt new` resolves the branch in this order: an existing local branch is
+attached as-is; otherwise, with `base` given, a new branch is created from
+it (local or remote, e.g. `wt new my-work origin/main`); otherwise, if
+`origin/<branch>` exists, a new local branch is created tracking it;
+otherwise a new branch is created off `HEAD`. Every command works from
+inside any worktree, not just the main checkout: paths are always resolved
+off the repo's shared `.git` dir.
 
 `wt rm` refuses to remove the main worktree, backs you out first if you're
 standing inside the one being removed, and offers to delete the local
-branch too once the worktree is gone.
+branch too once the worktree is gone. `wt rmf` is shorthand for `wt rm -f`.
+`wt rml` lets you multi-select worktrees to remove via fzf (tab/space to
+toggle), asking once whether to force all removals and once whether to
+delete the now-detached local branches.
 
 ## Hook
 
